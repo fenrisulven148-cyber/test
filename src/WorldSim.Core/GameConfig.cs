@@ -22,6 +22,12 @@ public sealed class GameConfig
     public int MaxStarvingDays { get; init; } = 3;           // сколько дней можно голодать до смерти
     public double StartingMoneyMin { get; init; } = 80;      // стартовые деньги (мин)
     public double StartingMoneyMax { get; init; } = 120;     // стартовые деньги (макс)
+    public double EatHungerThreshold { get; init; } = 50;    // порог голода «пора поесть»
+
+    // ── Потребление жителями (спрос на все три товара) ───────────────────
+    public int WoodConsumptionPeriodDays { get; init; } = 4; // дрова нужны всем раз в N дней
+    public double WoodPerHousehold { get; init; } = 1;       // единиц дерева на растопку
+    public double ToolWearPerProducingDay { get; init; } = 0.2; // инструментов снашивается за рабочий день
 
     // ── Производство (за тик, только если есть сырьё) ────────────────────
     public double FarmerFoodOutput { get; init; } = 0.6;         // еды за тик
@@ -35,10 +41,12 @@ public sealed class GameConfig
     public double BasePrice { get; init; } = 10.0;           // цена при «нормальном» запасе
     public double TargetStock { get; init; } = 50.0;         // эталонный запас товара на рынке
     public double PriceSensitivity { get; init; } = 0.7;     // сила реакции цены на нехватку/избыток
+    public double MaxStockFactor { get; init; } = 2.0;       // рынок не скупает товар сверх TargetStock*фактор
 
     // ── Торговцы ─────────────────────────────────────────────────────────
     public double MerchantBuyMargin { get; init; } = 0.9;    // покупают у жителей по цене*маржа
-    public double SellPriceFactor { get; init; } = 1.1;      // жители покупают еду по цене*фактор
+    public double SellPriceFactor { get; init; } = 1.1;      // жители покупают любую еду/товар по цене*фактор
+    public double MerchantCommissionShare { get; init; } = 1.0; // доля разницы цен, уходящая торговцам (комиссия)
 
     // ── Стартовые запасы на рынке ──────────────────────────────────────────
     public double InitialFoodStock { get; init; } = 30;

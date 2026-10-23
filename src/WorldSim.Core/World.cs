@@ -16,13 +16,17 @@ public sealed class World
     private readonly Random _rng;
 
     // ── Денежный учёт (для теста «деньги не из воздуха») ──────────────────
-    /// <summary>Эмиссия: сколько денег банк выдал жителям при старте мира.</summary>
+    /// <summary>Эмиссия: сколько денег банк выдал жителям и рынку при старте мира.</summary>
     public double EmittedTotal { get; private set; }
     /// <summary>Сжигание: деньги умерших жителей изымаются из обращения.</summary>
     public double BurnedTotal { get; private set; }
 
     /// <summary>Все деньги в экономике: у живых жителей + касса рынка.</summary>
     public double MoneyInEconomy() => MoneyInCirculation() + Market.Cash;
+
+    // Комиссии (наценка рынка сверх закупочной цены) копятся в кассе и в конце дня
+    // распределяются торговцам. Это перераспределение, а не эмиссия.
+    private double _commissionDue;
 
     private static readonly string[] Names =
     {
@@ -82,15 +86,24 @@ public sealed class World
     /// <summary>Продвинуть мир на один тик (час).</summary>
     public void TickOnce()
     {
+        bool isEndOfDay = (Tick + 1) % Config.TicksPerDay == 0;
+
         foreach (var r in _residents.Where(r => r.IsAlive))
         {
             AdvanceHunger(r);
             Produce(r);
             SellProduce(r);
             TryBuyFood(r);
+            if (isEndOfDay)
+            {
+                ConsumeWood(r);      // дрова нужны всем раз в N дней
+                WearTools(r);        // инструменты изнашиваются у производящих профессий
+                BuyToolsIfBroken(r); // спрос на инструменты
+            }
         }
 
-        EndOfDayIfDue();
+        if (isEndOfDay) PayMerchantCommissions();
+        EndOfDayIfDue(isEndOfDay);
         Market.UpdatePrices();
         Tick++;
     }
@@ -125,30 +138,23 @@ public sealed class World
                 }
                 break;
             case Profession.Merchant:
-                break; // торговцы не производят — они обслуживают рынок
+                break; // торговцы не производят — живут с комиссии (PayMerchantCommissions)
         }
     }
 
-    /// <summary>Излишки товара житель сдаёт на рынок за деньги из кассы рынка.</summary>
+    /// <summary>
+    /// Излишки товара житель сдаёт на рынок по одной целой единице за раз.
+    /// Ограничения внутри Market.SellToMarket: склад не больше MaxStockFactor*TargetStock,
+    /// выплаты только из кассы — эмиссия во время тика запрещена.
+    /// </summary>
     private void SellProduce(Resident r)
     {
         foreach (var g in Goods.All)
         {
             double keep = KeepAmount(r, g);
-            double surplus = r.Get(g) - keep;
-            if (surplus > 1e-9)
-            {
-                double price = Market.UnitBuyPrice(g);
-                // Выплачиваем ровно столько, сколько есть в кассе (эмиссия запрещена).
-                double affordableUnits = Market.Cash / price;
-                double units = Math.Min(surplus, affordableUnits);
-                if (units <= 1e-9) continue; // касса пуста — сделка не состоялась
-                double payout = price * units;
-                Market.PayOut(payout);
-                Market.AcceptGoods(g, units);
-                r.Add(g, -units);
-                r.Money += payout;
-            }
+            int surplusUnits = (int)Math.Floor(r.Get(g) - keep + 1e-9);
+            if (surplusUnits <= 0) continue;
+            Market.SellToMarket(g, r, surplusUnits);
         }
     }
 
@@ -161,38 +167,100 @@ public sealed class World
             double mealsPerDay = Config.HungerPerTick * Config.TicksPerDay / Config.FullMealHungerRestore;
             return Math.Ceiling(mealsPerDay);
         }
-        if (g == GoodsType.Wood && r.Profession == Profession.Blacksmith)
-            return 0; // всё дерево идёт в переработку/продажу
         return 0;
     }
 
-    /// <summary>Житель покупает еду на рынке, если голоден и есть деньги.</summary>
+    /// <summary>
+    /// Житель покупает еду на рынке, если голоден и есть деньги.
+    /// Покупает и съедает РОВНО ОДНУ порцию за тик (не всё доступное).
+    /// </summary>
     private void TryBuyFood(Resident r)
     {
-        if (r.Hunger < 50) return;
-        double price = Market.PriceForBuyer(GoodsType.Food);
-        double afford = Math.Floor(r.Money / price);
-        if (afford <= 0) return; // денег нет — остаётся голодать
-        double amount = Math.Min(afford, Math.Max(1, Market.GetStock(GoodsType.Food)));
-        if (amount <= 0) return;
-        if (Market.BuyFromMarket(GoodsType.Food, amount, r, out double cost))
+        if (r.Hunger < Config.EatHungerThreshold) return;
+        int bought = Market.BuyFromMarket(GoodsType.Food, 1, r);
+        if (bought > 0)
         {
-            // Деньги за покупку остаются в экономике: переводим их с личного счёта
-            // покупателя в кассу рынка.
-            Market.Deposit(cost);
-            double meals = Math.Floor(amount);
-            if (meals > 0)
-            {
-                r.Add(GoodsType.Food, -meals);
-                r.Hunger = Math.Max(0, r.Hunger - meals * Config.FullMealHungerRestore);
-            }
+            Eat(r, GoodsType.Food, bought);
+            _commissionDue += CommissionFor(GoodsType.Food, bought);
+        }
+    }
+
+    /// <summary>Житель съедает/сжигает купленный товар (он уже в его инвентаре).</summary>
+    private void Eat(Resident r, GoodsType g, int units)
+    {
+        r.Add(g, -units);
+        if (g == GoodsType.Food)
+            r.Hunger = Math.Max(0, r.Hunger - units * Config.FullMealHungerRestore);
+    }
+
+    /// <summary>Наценка рынка над закупочной ценой — будущая комиссия торговцам.</summary>
+    private double CommissionFor(GoodsType g, int units) =>
+        (Market.PriceForBuyer(g) - Market.UnitBuyPrice(g)) * units;
+
+    /// <summary>Комиссия торговцам выплачивается в конце дня из кассы (перераспределение, не эмиссия).</summary>
+    private void PayMerchantCommissions()
+    {
+        if (_commissionDue <= 1e-12) return;
+        var merchants = _residents.Where(r => r.IsAlive && r.Profession == Profession.Merchant).ToList();
+        if (merchants.Count == 0) return; // без торговцев сумма остаётся в кассе рынка
+        double take = Math.Min(_commissionDue, Market.Cash);
+        if (take <= 1e-12) return;
+        Market.PayOut(take);
+        double share = take / merchants.Count;
+        foreach (var m in merchants) m.Money += share;
+        _commissionDue = 0;
+    }
+
+    /// <summary>Раз в WoodConsumptionPeriodDays дней каждый житель топит печь: 1 ед. дерева.</summary>
+    private void ConsumeWood(Resident r)
+    {
+        int period = Config.WoodConsumptionPeriodDays;
+        if (period <= 0 || Day % period != 0) return;
+        // Сначала берём из собственного инвентаря (дерево сожжено).
+        double need = Config.WoodPerHousehold;
+        double fromInventory = Math.Min(r.Get(GoodsType.Wood), need);
+        if (fromInventory > 1e-9) r.Add(GoodsType.Wood, -fromInventory);
+        need -= fromInventory;
+        // Недостающее докупаем на рынке по одной единице; купленное сразу идёт в печь.
+        while (need > 1e-9)
+        {
+            int bought = Market.BuyFromMarket(GoodsType.Wood, 1, r);
+            if (bought == 0) break; // нет денег/склада/кассы — мёрзнем, но выживаем
+            Eat(r, GoodsType.Wood, bought);
+            _commissionDue += CommissionFor(GoodsType.Wood, bought);
+            need -= bought;
+        }
+    }
+
+    private static bool IsProducingProfession(Profession p) =>
+        p == Profession.Farmer || p == Profession.Lumberjack || p == Profession.Blacksmith;
+
+    /// <summary>Инструменты изнашиваются у производящих профессий (фермеры, дровосеки, кузнецы).</summary>
+    private void WearTools(Resident r)
+    {
+        if (!IsProducingProfession(r.Profession)) return;
+        double wear = Math.Min(r.Get(GoodsType.Tools), Config.ToolWearPerProducingDay);
+        if (wear > 1e-9) r.Add(GoodsType.Tools, -wear);
+        // Сломанный инструмент списан и в оборот не возвращается.
+    }
+
+    /// <summary>Если рабочий инструмент изношен полностью — житель покупает новый на рынке.</summary>
+    private void BuyToolsIfBroken(Resident r)
+    {
+        if (!IsProducingProfession(r.Profession)) return;
+        if (r.Get(GoodsType.Tools) >= 1.0 - 1e-9) return;
+        int bought = Market.BuyFromMarket(GoodsType.Tools, 1, r);
+        if (bought > 0)
+        {
+            r.Add(GoodsType.Tools, -bought); // тут же ставится вместо сломанного
+            _commissionDue += CommissionFor(GoodsType.Tools, bought);
         }
     }
 
     /// <summary>Раз в конце дня: учёт голодавших и смертей.</summary>
-    private void EndOfDayIfDue()
+    private void EndOfDayIfDue(bool isEndOfDay)
     {
-        if ((Tick + 1) % Config.TicksPerDay != 0) return;
+        if (!isEndOfDay) return;
         DeathsToday = 0;
         foreach (var r in _residents.Where(r => r.IsAlive))
         {
